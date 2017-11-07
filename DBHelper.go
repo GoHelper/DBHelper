@@ -5,6 +5,7 @@ import(
 	"reflect"
 	"strings"
 	"errors"
+	//"fmt"
 )
 
 type DB struct{
@@ -12,17 +13,35 @@ type DB struct{
 	ConnectionString string
 }
 
+func (db DB) Exec(sqlText string) error {
+	conn,err := sql.Open(db.DbDriver,db.ConnectionString)
+	if(err!=nil){
+		return err;
+	}
+	_,err = conn.Exec(sqlText)
+	if(err!=nil){
+		return err;
+	}
+	return nil
+}
 
-func (db DB) Query(sqlText string,T *interface{}) (error){
+func (db DB) Query(T interface{},sqlText string,sqlArgs ...interface{}) (error){
 	var structType reflect.Type = nil;
-	s := nil
-	
-	
+	var mapType reflect.Type = nil;
+	var singleValueType reflect.Type = nil;
+	var dataCount int = 0;
 	outType := reflect.TypeOf(T).Elem()
-	switch(outType.Kind()){
-	case reflect.Invalid,reflect.Uintptr,reflect.Complex64,reflect.Complex128,reflect.Chan,reflect.Func,reflect.Ptr,reflect.UnsafePointer://nonsupported types
+	outTypeKind := outType.Kind()
+	switch(outTypeKind){
+	case reflect.Invalid,reflect.Uintptr,reflect.Complex64,reflect.Complex128,reflect.Chan,reflect.Func,reflect.Ptr,reflect.UnsafePointer://unsupported types
 		return errors.New("type error")
 	case reflect.Slice,reflect.Array://if slice will returns all rows.if array will returns rows that count <= len(array) 
+		if(outTypeKind==reflect.Slice){
+			dataCount = -1
+		}else{
+			dataCount = outType.Len()
+		}
+		
 		itemType := outType.Elem()
 		switch itemType.Kind() {
 			case reflect.Invalid,reflect.Uintptr,reflect.Complex64,reflect.Complex128,reflect.Chan,reflect.Func,reflect.Ptr,reflect.UnsafePointer,reflect.Slice,reflect.Array://nonsupported types
@@ -30,30 +49,73 @@ func (db DB) Query(sqlText string,T *interface{}) (error){
 			case reflect.Struct:
 				structType = itemType
 			case reflect.Map:
+				mapType = itemType
 			default:
+				singleValueType = itemType
 		}
 	case reflect.Struct: //will save first row into this struct
+		dataCount = 1
 		structType = outType
 	case reflect.Map://will save first row into this map
+		dataCount = 1
+		mapType = outType
 	default://will save first row's first column
+		dataCount = 1
+		singleValueType = outType
 	}
-	
 	conn,err := sql.Open(db.DbDriver,db.ConnectionString)
-	if(err==nil){
-		return err;
-	}
-	rows,err := conn.Query(sqlText)
 	if(err!=nil){
 		return err;
 	}
-	args := buildArgsByDbAndStruct(structType,rows)
-	for(rows.Next()){
-		rows.Scan(args...)
-
+	rows,err := conn.Query(sqlText,sqlArgs...)
+	if(err!=nil){
+		return err;
 	}
-
-
-	reflect.ValueOf(T).Field(0)
+	var args []interface{}
+	if(structType!=nil){
+		args = buildArgsByDbAndStruct(structType,rows)
+	}else if(mapType!=nil){
+		args = buildArgsByDbAndType(mapType.Elem(),rows)
+	}else if(singleValueType != nil){
+		args = buildArgsByDbAndType(singleValueType,rows)
+	}
+	i :=-1
+	for(rows.Next()){
+		i++;
+		if(dataCount>=0&&i>=dataCount){
+			break
+		}
+		rows.Scan(args...)
+		if(structType!=nil){
+			structValue,err := saveValueToStruct(args,rows,structType)
+			if(err!=nil) {
+				return err
+			}
+			switch outTypeKind {
+			case reflect.Struct:
+				reflect.ValueOf(T).Elem().Set(structValue)
+			case reflect.Array:
+				reflect.ValueOf(T).Elem().Index(i).Set(structValue)
+			case reflect.Slice:
+				s := reflect.ValueOf(T).Elem()
+				s.Set(reflect.Append(s,structValue))
+			}
+		} else if mapType!=nil {
+			// keyType := mapType.Key()
+			// for(c:=0;c<rows.Columns())
+			// keyValue := reflect.Zero(keyType)
+			// keyValue.SetString()
+			// switch outTypeKind {
+			// case reflect.Map:
+			// 	reflect.ValueOf(T).Elem().Set(structValue)
+			// case reflect.Array:
+			// 	reflect.ValueOf(T).Elem().Index(i).Set(structValue)
+			// case reflect.Slice:
+			// 	reflect.Append(reflect.ValueOf(T).Elem(),structValue)	
+			// }
+		}
+	}
+	return nil
 }
 
 func buildArgsByDbAndStruct(t reflect.Type,rows *sql.Rows) []interface{} {
@@ -71,17 +133,40 @@ func buildArgsByDbAndStruct(t reflect.Type,rows *sql.Rows) []interface{} {
 	return args;
 }
 
-func saveValueToStruct(args interface{},rows *sql.Rows,t reflect.Type)(error){
+func buildArgsByDbAndType(valueType reflect.Type,rows *sql.Rows) []interface{} {
+	var args []interface{}
 	cols,err := rows.Columns()
 	if(err!=nil){
-		return err;
+		return args
 	}
-	val := reflect.New(t)
+	args = make([]interface{},len(cols))
+	argsValue := reflect.ValueOf(&args)
+	for i,_ := range(cols) {
+		argsValue.Elem().Index(i).Set(reflect.New(valueType))
+	}
+	return args;
+}
+
+// function saveValutToMap(args[]interface{},rows *sql.Rows,mapType reflect.Type)(reflect.Value,error){
+// 	val := reflect.Make()
+// }
+
+func saveValueToStruct(args []interface{},rows *sql.Rows,structType reflect.Type)(reflect.Value,error){
+	var val reflect.Value
+	if(val.IsValid()){
+		val.Set(reflect.Zero(structType))
+	}else{
+		val = reflect.New(structType).Elem()
+	}
+	cols,err := rows.Columns()
+	if(err!=nil){
+		return val,err;
+	}
+	
 	for i,field := range cols {
-		fieldType := getTypeByName2(t,field)
-		val.FieldByName("")
+		setStructValue(val,field,args[i])
 	}
-	return nil
+	return val,nil
 }
 
 func getTypeByName(s *interface{},name string) (reflect.Type){
@@ -126,8 +211,8 @@ func setStructValue(structValue reflect.Value,name string,fieldValue interface{}
 		}
 	}
 	if firstIndex>-1 {
-		structValue.Field(firstIndex).Set(reflect.ValueOf(fieldValue))
+		structValue.Field(firstIndex).Set(reflect.ValueOf(fieldValue).Elem())
 	} else if secondIndex>-1 {
-		structValue.Field(secondIndex).Set(reflect.ValueOf(fieldValue))
+		structValue.Field(secondIndex).Set(reflect.ValueOf(fieldValue).Elem())
 	}
 }
